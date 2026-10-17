@@ -65,6 +65,8 @@ async function startGenerate() {
   const fd = new FormData();
   fd.append("file", file);
   fd.append("lang", el("lang").value);
+  // checked -> always OCR with Sarvam Vision; unchecked -> auto (OCR only scans)
+  fd.append("ocr", el("ocr").checked ? "always" : "auto");
 
   try {
     const r = await fetch("/api/generate", { method: "POST", body: fd });

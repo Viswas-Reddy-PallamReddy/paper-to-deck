@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
 import re
 import sys
 import time
+import zipfile
 from string import Template
 
 import requests
@@ -182,10 +184,129 @@ def asr(audio_path: str, *, mode: str = "codemix",
 # ---------------------------------------------------------------------------
 # 1. PDF -> text
 # ---------------------------------------------------------------------------
-def extract_text(pdf_path: str, max_chars: int = 24000) -> str:
+def _condense(text: str, max_chars: int) -> str:
+    """Fit a long paper into the context budget without losing the whole.
+
+    Truncating a 40-page survey to its first pages produces a deck about the
+    introduction only. Instead we keep the opening (title, abstract, start of
+    the first section) and then sample evenly spaced passages across the rest,
+    so every part of the paper is represented.
+    """
+    if len(text) <= max_chars:
+        return text
+    head = text[:3500]
+    rest = text[3500:]
+    budget = max(max_chars - len(head), 2000)
+    n = 8
+    seg = max(budget // n, 500)
+    step = max(len(rest) // n, 1)
+    parts = [head]
+    for i in range(n):
+        start = i * step
+        parts.append("\n\n[...]\n\n" + rest[start:start + seg])
+    return "".join(parts)[:max_chars]
+
+
+# ---------------------------------------------------------------------------
+# 1b. OCR / digitisation with Sarvam Vision (Document AI)
+# ---------------------------------------------------------------------------
+VISION_MAX_PAGES = 10        # Document AI caps a single job at 10 pages
+_EMBEDDED_IMG = re.compile(r"!\[[^\]]*\]\(data:image/[^)]*\)", re.I)
+_IMG_DESC = re.compile(r"^\*[^\n]*\bimage\b[^\n]*\*\s*$", re.I | re.M)
+
+
+def _strip_embedded_images(text: str) -> str:
+    """Drop the image payloads Vision returns: base64 data URIs and the
+    fully-italic paragraphs it writes to describe a figure."""
+    text = _EMBEDDED_IMG.sub("", text)
+    text = _IMG_DESC.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def _digitise_bytes(data: bytes, filename: str, language: str,
+                    output_format: str) -> str:
+    """One Document AI job: submit -> poll -> download -> return the text."""
+    key = {"api-subscription-key": API_KEY}
+    r = requests.post(f"{BASE}/doc-ai/v1/job/digitise", headers=key,
+                      files={"file": (filename, data, "application/pdf")},
+                      data={"language": language, "output_format": output_format},
+                      timeout=180)
+    if r.status_code not in (200, 201):
+        raise SarvamError(f"doc-ai create -> {r.status_code}: {r.text[:200]}")
+    job_id = r.json()["job_id"]
+
+    terminal = {"completed", "partially_completed", "failed", "rejected"}
+    status = "pending"
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        s = requests.get(f"{BASE}/doc-ai/v1/job/{job_id}/status",
+                         headers=key, timeout=60).json()
+        status = str(s.get("status", "")).lower()
+        if status in terminal:
+            break
+        time.sleep(3)
+    if status not in ("completed", "partially_completed"):
+        raise SarvamError(f"doc-ai job {job_id} ended as '{status}'")
+
+    dl = requests.get(f"{BASE}/doc-ai/v1/job/{job_id}/download-url",
+                      headers=key, timeout=60).json()
+    z = requests.get(dl["url"], timeout=180)
+    z.raise_for_status()
+    zf = zipfile.ZipFile(io.BytesIO(z.content))
+    want = ".md" if output_format == "md" else ".html"
+    for name in zf.namelist():
+        if name.lower().endswith(want):
+            return zf.read(name).decode("utf-8", "ignore")
+    return ""
+
+
+def extract_text_vision(pdf_path: str, *, language: str = "en-IN",
+                        output_format: str = "md", progress=None) -> str:
+    """Digitise a PDF with Sarvam Vision, chunked to respect the 10-page cap.
+
+    Handles scans and digital PDFs alike, keeps reading order, and converts
+    tables to Markdown - which is exactly what the downstream model needs.
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(pdf_path)
+    total = len(reader.pages)
+    out = []
+    for start in range(0, total, VISION_MAX_PAGES):
+        end = min(start + VISION_MAX_PAGES, total)
+        if progress:
+            progress("ocr", int(100 * start / max(total, 1)),
+                     f"OCR: pages {start + 1}-{end} of {total}")
+        writer = PdfWriter()
+        for i in range(start, end):
+            writer.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        writer.write(buf)
+        out.append(_digitise_bytes(buf.getvalue(),
+                                   f"pages_{start + 1}-{end}.pdf",
+                                   language, output_format))
+    return _strip_embedded_images("\n\n".join(out))
+
+
+# ---------------------------------------------------------------------------
+# 1. PDF -> text
+# ---------------------------------------------------------------------------
+def extract_text(pdf_path: str, max_chars: int = 24000, ocr: str = "auto",
+                 progress=None) -> str:
+    """Extract text from a PDF.
+
+    ocr="auto"   - read the PDF text layer, falling back to Sarvam Vision when
+                   there is almost none (i.e. the file is a scan)
+    ocr="always" - always use Sarvam Vision (best for scans and heavy tables)
+    ocr="never"  - read the text layer only
+    """
     if pdf_path.lower().endswith(".txt"):
         with open(pdf_path, encoding="utf-8") as f:
-            return f.read()[:max_chars]
+            return _condense(f.read(), max_chars)
+
+    if ocr == "always":
+        return _condense(extract_text_vision(pdf_path, progress=progress),
+                         max_chars)
 
     from pypdf import PdfReader
 
@@ -194,10 +315,12 @@ def extract_text(pdf_path: str, max_chars: int = 24000) -> str:
     text = "\n".join(pages)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    if len(text.strip()) < 200:
-        print("  ! very little text extracted - the PDF may be a scan. "
-              "Use Sarvam Vision (document intelligence) for OCR instead.")
-    return text[:max_chars]
+
+    if len(text.strip()) < 200 and ocr == "auto":
+        print("  ! little text in the PDF layer - running Sarvam Vision OCR...")
+        text = extract_text_vision(pdf_path, progress=progress)
+
+    return _condense(text, max_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -663,7 +786,8 @@ def answer_from_paper(paper: str, question: str, slide_title: str = "",
 # ---------------------------------------------------------------------------
 def generate_deck(paper_path: str, outdir: str, *, lang: str = "en-IN",
                   speaker: str | None = None, model: str = TTS_MODEL_DEFAULT,
-                  translate: bool = False, progress=None) -> dict:
+                  translate: bool = False, ocr: str = "auto",
+                  max_chars: int = 12000, progress=None) -> dict:
     """Run the full pipeline, optionally reporting progress.
 
     progress(stage: str, pct: int, message: str) is called at each step, so a
@@ -677,7 +801,7 @@ def generate_deck(paper_path: str, outdir: str, *, lang: str = "en-IN",
     os.makedirs(outdir, exist_ok=True)
 
     say("extract", 5, "Reading the PDF...")
-    paper = extract_text(paper_path)
+    paper = extract_text(paper_path, max_chars=max_chars, ocr=ocr, progress=progress)
     # keep the raw text next to the deck - the Q&A endpoint uses it as context
     with open(os.path.join(outdir, "paper.txt"), "w", encoding="utf-8") as f:
         f.write(paper)
@@ -725,6 +849,10 @@ def main():
     ap.add_argument("--outdir", default="deck")
     ap.add_argument("--translate", action="store_true",
                     help="build in English, then localise via the Translate API")
+    ap.add_argument("--ocr", choices=["auto", "always", "never"], default="auto",
+                    help="Sarvam Vision OCR: auto falls back on scanned PDFs")
+    ap.add_argument("--max-chars", type=int, default=12000,
+                    help="how much paper text to feed the model (default 12000)")
     args = ap.parse_args()
 
     if not API_KEY:
@@ -734,7 +862,8 @@ def main():
         print(f"[{pct:3d}%] {msg}")
 
     generate_deck(args.pdf, args.outdir, lang=args.lang, speaker=args.speaker,
-                  model=args.model, translate=args.translate, progress=_p)
+                  model=args.model, translate=args.translate, ocr=args.ocr,
+                  max_chars=args.max_chars, progress=_p)
     print(f"      open: {os.path.join(args.outdir, 'index.html')}")
 
 

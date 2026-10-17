@@ -24,6 +24,7 @@ main{max-width:920px;margin:0 auto;padding:28px 20px 80px}
 .row{display:flex;gap:14px;align-items:flex-end;margin-top:20px;flex-wrap:wrap}
 label{font-size:13px;color:var(--muted);display:block;margin-bottom:5px}
 select{font:inherit;padding:9px 12px;border:1px solid var(--line);border-radius:9px;background:#fff}
+.chk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);margin:0}
 button.primary{background:var(--accent);color:#fff;border:none;border-radius:9px;
                padding:11px 22px;font-size:14px;font-weight:600;cursor:pointer}
 button.primary:hover:not(:disabled){background:var(--accent-dark)}

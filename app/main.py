@@ -4,7 +4,7 @@ Paper -> Deck : full-stack web app backend (FastAPI).
 Endpoints
 ---------
   GET  /                          the single-page app
-  POST /api/generate              upload a PDF + language -> {job_id}
+  POST /api/generate              upload a PDF + language (+ ocr) -> {job_id}
   GET  /api/jobs/{job_id}         poll progress: {status, pct, message, stage}
   GET  /api/decks/{job_id}/deck.json   the built deck (slides + audio urls)
   GET  /api/decks/{job_id}/audio/{name}  narration wav
@@ -66,13 +66,14 @@ def _set(job_id: str, **kw):
 # ---------------------------------------------------------------------------
 # generation (background thread)
 # ---------------------------------------------------------------------------
-def _run_job(job_id: str, pdf_path: str, lang: str):
+def _run_job(job_id: str, pdf_path: str, lang: str, ocr: str):
     def progress(stage: str, pct: int, msg: str):
         _set(job_id, status="running", stage=stage, pct=pct, message=msg)
 
     try:
         outdir = os.path.join(DECKS, job_id)
-        result = rtd.generate_deck(pdf_path, outdir, lang=lang, progress=progress)
+        result = rtd.generate_deck(pdf_path, outdir, lang=lang, ocr=ocr,
+                                   progress=progress)
         outline = result["outline"]
 
         slides = []
@@ -100,11 +101,14 @@ def _run_job(job_id: str, pdf_path: str, lang: str):
 # API
 # ---------------------------------------------------------------------------
 @app.post("/api/generate")
-async def generate(file: UploadFile = File(...), lang: str = Form("en-IN")):
+async def generate(file: UploadFile = File(...), lang: str = Form("en-IN"),
+                   ocr: str = Form("auto")):
     if not rtd.API_KEY:
         raise HTTPException(500, "SARVAM_API_KEY is not set on the server")
     if lang not in rtd.LANG_NAMES:
         raise HTTPException(400, f"unsupported language: {lang}")
+    if ocr not in ("auto", "always", "never"):
+        raise HTTPException(400, f"unsupported ocr mode: {ocr}")
 
     job_id = uuid.uuid4().hex[:12]
     workdir = os.path.join(DECKS, job_id)
@@ -115,8 +119,8 @@ async def generate(file: UploadFile = File(...), lang: str = Form("en-IN")):
 
     with LOCK:
         JOBS[job_id] = {"status": "queued", "pct": 0, "message": "Queued",
-                        "stage": "queued", "lang": lang}
-    threading.Thread(target=_run_job, args=(job_id, pdf_path, lang),
+                        "stage": "queued", "lang": lang, "ocr": ocr}
+    threading.Thread(target=_run_job, args=(job_id, pdf_path, lang, ocr),
                      daemon=True).start()
     return {"job_id": job_id}
 

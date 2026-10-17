@@ -31,6 +31,8 @@ Paper → Deck closes that gap in three ways:
   explanation generated with natural Indian-language voices.
 - **Multilingual** — narration and answers in Hindi, Bengali, Tamil, Telugu,
   Marathi, Gujarati, Kannada, Malayalam, Punjabi, Odia, and English.
+- **Scanned PDFs welcome** — Sarvam Vision OCR reads scans and converts tables
+  to Markdown across 23 languages, so image-only papers work too.
 - **Automatic visuals** — the model selects a chart, timeline, comparison, or
   flow diagram for each slide and supplies its data.
 - **Per-slide voice Q&A** — hold to ask a question; the answer is scoped to the
@@ -81,7 +83,7 @@ check the exact figure or wording without leaving the slide.
 
 | Layer | Choice |
 |-------|--------|
-| Language, speech & reasoning | [Sarvam AI](https://www.sarvam.ai) — Sarvam-105B, Bulbul (TTS), Saaras (ASR), Mayura (translation) |
+| Language, speech, vision & reasoning | [Sarvam AI](https://www.sarvam.ai) — Sarvam-105B, Bulbul (TTS), Saaras (ASR), Mayura (translation), Sarvam Vision (OCR) |
 | Backend | Python, FastAPI, Uvicorn |
 | Frontend | Vanilla HTML / CSS / JavaScript single-page app |
 | Deck rendering | HTML with inline SVG visuals |
@@ -92,6 +94,7 @@ check the exact figure or wording without leaving the slide.
 | Capability | Endpoint | Model |
 |------------|----------|-------|
 | Chat & reasoning | `POST /v1/chat/completions` | `sarvam-105b` |
+| Document OCR | `POST /doc-ai/v1/job/digitise` | Sarvam Vision |
 | Text to speech | `POST /text-to-speech` | `bulbul:v3` |
 | Speech to text | `POST /speech-to-text` | `saaras:v4` |
 | Translation | `POST /translate` | `mayura:v1` |
@@ -130,7 +133,9 @@ open deck/index.html
 ```
 
 `--lang` sets the narration language, and `--translate` builds in English first
-and then localises the deck through the translation API.
+and then localises the deck through the translation API. `--ocr always` forces
+Sarvam Vision OCR (the default, `auto`, falls back to it automatically when a
+PDF turns out to be a scan rather than text).
 
 ## API
 
