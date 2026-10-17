@@ -640,6 +640,10 @@ def main():
     print("[1/5] extracting text from PDF...")
     paper = extract_text(args.pdf)
     print(f"      {len(paper)} characters")
+    # keep the raw text next to the deck - the Q&A server / serverless
+    # function uses it as grounding context
+    with open(os.path.join(args.outdir, "paper.txt"), "w", encoding="utf-8") as f:
+        f.write(paper)
 
     print("[2/5] building the outline with Sarvam-105B...")
     outline = build_outline(paper, "en-IN" if args.translate else args.lang)

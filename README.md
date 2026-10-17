@@ -84,6 +84,44 @@ CLI, for testing without a browser:
 python voice_qa.py --paper paper.pdf --audio question.wav
 ```
 
+## Deploy to Vercel
+
+Vercel hosts two things: the **deck** (static, from `public/`) and the **`/ask`**
+Q&A as a Python serverless function. The generator does *not* run on Vercel - it
+is a long batch job - so you build the deck locally and deploy the output.
+
+```bash
+npm i -g vercel                              # once
+export SARVAM_API_KEY="sk-..."
+bash prepare_vercel.sh paper.pdf en-IN       # builds public/, stages api/paper.txt
+vercel --prod                                # deploy
+```
+
+Then set the env var in the Vercel dashboard (Settings -> Environment Variables):
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `SARVAM_API_KEY` | yes | auth for every Sarvam call |
+| `QA_LANG` | no | answer language (default `en-IN`) |
+| `PAPER_TEXT` | no | overrides `api/paper.txt` if you would rather not commit the paper text |
+
+What maps to what:
+
+```
+public/       -> static deck served at /        (vercel.json: outputDirectory)
+api/ask.py    -> POST /api/ask, rewritten from /ask
+vercel.json   -> the rewrite + maxDuration: 60
+```
+
+Two limits to know:
+
+- **Function timeout.** `/ask` does ASR + LLM + TTS in a single request. Vercel
+  Hobby caps a function at 60s; if it times out, move the backend to a host that
+  runs a long-lived server (Render, Railway, Fly) - `voice_qa.py` runs there
+  almost unchanged - and keep the static deck on Vercel.
+- **Request size.** Audio is sent base64 in the body; keep clips short (a few
+  seconds) to stay well under Vercel's body limit.
+
 ## Sarvam APIs used (all confirmed working)
 
 | Call | Endpoint | Model | Role |

@@ -1,15 +1,19 @@
 # secrets
 .env
 
-# generated output
+# local generation output (the deployed deck lives in public/)
 deck/
 deck_*/
-*.wav
 outline.json
+
+# the big pre-built sample deck (regenerate with demo.sh)
+sample_deck.zip
 
 # python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-sample_deck.zip
+
+# vercel
+.vercel

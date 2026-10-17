@@ -1,0 +1,16 @@
+{
+  "framework": null,
+  "buildCommand": null,
+  "outputDirectory": "public",
+  "rewrites": [
+    {
+      "source": "/ask",
+      "destination": "/api/ask"
+    }
+  ],
+  "functions": {
+    "api/ask.py": {
+      "maxDuration": 60
+    }
+  }
+}
