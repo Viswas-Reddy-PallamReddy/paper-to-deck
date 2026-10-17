@@ -441,6 +441,14 @@ DECK_HTML = Template("""<!doctype html>
   .narr-bar audio { flex: 1; }
   .badge { font-size: .45em; color: #adb5bd; }
   .notes { font-size: .5em; color: #868e96; margin-top: 14px; }
+  .qa { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .qa-btn { font-size: .42em; padding: 10px 18px; border-radius: 8px; border: none; background: #3b5bdb; color: #fff; cursor: pointer; }
+  .qa-btn.rec { background: #e03131; }
+  .qa-status { font-size: .42em; color: #868e96; }
+  .qa-out { flex-basis: 100%; font-size: .42em; color: #343a40; line-height: 1.5; }
+  .qa-out .q { color: #868e96; font-style: italic; }
+  .qa-out .detail { margin-top: 6px; padding: 10px 12px; background: #f8f9fa; border-left: 3px solid #3b5bdb; white-space: pre-wrap; }
+  .qa-out .src { color: #adb5bd; margin-top: 4px; }
 </style></head>
 <body>
 <div class="reveal"><div class="slides">
@@ -458,10 +466,92 @@ $slides
   Reveal.on('ready', playCurrent);
   document.addEventListener('keydown', function(e){ if (e.key === 'p') playCurrent(); });
 </script>
+<script>window.SLIDE_CTX = $ctx;</script>
+<script>
+(function(){
+  var SLIDE_CTX = window.SLIDE_CTX || [];
+  var rec = null, chunks = [];
+  function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function encodeWav(samples, rate){
+    var len = 0, i, j;
+    for (i = 0; i < samples.length; i++) len += samples[i].length;
+    var buf = new ArrayBuffer(44 + len*2), v = new DataView(buf);
+    function ws(o,s){ for (var k=0;k<s.length;k++) v.setUint8(o+k, s.charCodeAt(k)); }
+    ws(0,'RIFF'); v.setUint32(4,36+len*2,true); ws(8,'WAVE');
+    ws(12,'fmt '); v.setUint32(16,16,true); v.setUint16(20,1,true);
+    v.setUint16(22,1,true); v.setUint32(24,rate,true);
+    v.setUint32(28,rate*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
+    ws(36,'data'); v.setUint32(40,len*2,true);
+    var o = 44;
+    for (i=0;i<samples.length;i++){ var c=samples[i];
+      for (j=0;j<c.length;j++){ var x=Math.max(-1,Math.min(1,c[j]));
+        v.setInt16(o, x<0 ? x*0x8000 : x*0x7fff, true); o+=2; } }
+    return new Blob([buf], {type:'audio/wav'});
+  }
+  function b64(blob){
+    return new Promise(function(res,rej){ var r=new FileReader();
+      r.onload=function(){ res(r.result.split(',')[1]); }; r.onerror=rej; r.readAsDataURL(blob); });
+  }
+  function start(btn){
+    if (rec) return;
+    var status = btn.parentNode.querySelector('.qa-status');
+    var out = btn.parentNode.querySelector('.qa-out');
+    out.innerHTML = ''; status.textContent = 'listening...'; btn.classList.add('rec');
+    navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){
+      var ctx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
+      var src = ctx.createMediaStreamSource(stream);
+      var node = ctx.createScriptProcessor(4096,1,1);
+      chunks = [];
+      node.onaudioprocess = function(e){ chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+      src.connect(node); node.connect(ctx.destination);
+      rec = {stream:stream, src:src, node:node};
+    }).catch(function(){ status.textContent='mic blocked'; btn.classList.remove('rec'); });
+  }
+  function stop(btn){
+    if (!rec) return;
+    var r = rec; rec = null;
+    r.node.disconnect(); r.src.disconnect();
+    r.stream.getTracks().forEach(function(t){ t.stop(); });
+    btn.classList.remove('rec');
+    var status = btn.parentNode.querySelector('.qa-status');
+    var out = btn.parentNode.querySelector('.qa-out');
+    status.textContent = 'thinking...';
+    var sec = btn.closest('section');
+    var idx = parseInt(sec.getAttribute('data-idx'), 10);
+    var c = (idx >= 0 && SLIDE_CTX[idx]) ? SLIDE_CTX[idx] : {title:'', text:''};
+    var wav = encodeWav(chunks, 16000);
+    b64(wav).then(function(audio){
+      return fetch('/ask', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({audio:audio, slide_index:idx, slide_title:c.title, slide_text:c.text})});
+    }).then(function(res){ return res.json(); }).then(function(j){
+      if (j.error){ status.textContent='error'; out.textContent=j.error; return; }
+      status.textContent='';
+      var html = '<div class="q">You asked: ' + esc(j.transcript) + '</div>';
+      html += '<div class="a">' + esc(j.spoken) + '</div>';
+      if (j.detail) html += '<div class="detail">' + esc(j.detail) + '</div>';
+      if (j.source) html += '<div class="src">Source: ' + esc(j.source) + '</div>';
+      out.innerHTML = html;
+      if (j.audio) new Audio('data:audio/wav;base64,' + j.audio).play();
+    }).catch(function(e){ status.textContent='failed'; out.textContent=String(e); });
+  }
+  function wire(){
+    var btns = document.querySelectorAll('.qa-btn');
+    for (var i=0;i<btns.length;i++){ (function(btn){
+      btn.addEventListener('mousedown', function(){ start(btn); });
+      btn.addEventListener('mouseup', function(){ stop(btn); });
+      btn.addEventListener('mouseleave', function(){ stop(btn); });
+      btn.addEventListener('touchstart', function(e){ e.preventDefault(); start(btn); });
+      btn.addEventListener('touchend', function(e){ e.preventDefault(); stop(btn); });
+    })(btns[i]); }
+  }
+  if (document.readyState !== 'loading') wire();
+  else document.addEventListener('DOMContentLoaded', wire);
+})();
+</script>
 </body></html>
 """)
 
-SLIDE_HTML = Template("""  <section>
+SLIDE_HTML = Template("""  <section data-idx="$idx">
     <h2>$title</h2>
     <ul>$bullets</ul>
     $visual
@@ -469,10 +559,15 @@ SLIDE_HTML = Template("""  <section>
       <audio controls src="$audio"></audio>
       <span class="badge">narrated</span>
     </div>
+    <div class="qa">
+      <button class="qa-btn" type="button">Ask about this slide</button>
+      <span class="qa-status"></span>
+      <div class="qa-out"></div>
+    </div>
   </section>
 """)
 
-TITLE_SLIDE = Template("""  <section>
+TITLE_SLIDE = Template("""  <section data-idx="-1">
     <h2>$title</h2>
     <p class="subtitle">$subtitle</p>
     <div class="narr-bar">
@@ -485,6 +580,8 @@ TITLE_SLIDE = Template("""  <section>
 
 def render_html(outline: dict, audio_files: list[str], out_path: str):
     blocks = []
+    ctx = []  # per-slide context handed to the voice Q&A widget
+
     # title slide (reuses slide 1's audio if there is one)
     first_audio = audio_files[0] if audio_files else ""
     blocks.append(TITLE_SLIDE.substitute(
@@ -492,16 +589,29 @@ def render_html(outline: dict, audio_files: list[str], out_path: str):
         subtitle=_esc(outline.get("deck_subtitle", "")),
         audio=first_audio,
     ))
-    for slide, audio in zip(outline["slides"], audio_files):
+
+    for i, (slide, audio) in enumerate(zip(outline["slides"], audio_files)):
         bullets = "".join(f"<li>{_esc(b)}</li>" for b in slide.get("bullets", []))
         blocks.append(SLIDE_HTML.substitute(
+            idx=str(i),
             title=_esc(slide.get("title", "")),
             bullets=bullets,
             visual=render_visual(slide),
             audio=audio,
         ))
-    html = DECK_HTML.substitute(title=_esc(outline.get("deck_title", "Deck")),
-                                slides="\n".join(blocks))
+        ctx.append({
+            "title": slide.get("title", ""),
+            "text": (slide.get("title", "") + "\n"
+                     + " ".join(slide.get("bullets", [])) + "\n"
+                     + slide.get("narration", "")),
+        })
+
+    ctx_json = json.dumps(ctx, ensure_ascii=False).replace("</", "<\\/")
+    html = DECK_HTML.substitute(
+        title=_esc(outline.get("deck_title", "Deck")),
+        slides="\n".join(blocks),
+        ctx=ctx_json,
+    )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
 

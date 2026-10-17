@@ -1,22 +1,29 @@
 """
 voice_qa.py
 ===========
-STRETCH FEATURE: talk to the paper.
+Ask the paper - scoped to the slide you are looking at.
 
-    mic  ->  Saaras ASR  ->  Sarvam-105B answer  ->  Bulbul TTS  ->  speaker
+    mic -> Saaras ASR -> Sarvam-105B (whole paper + current slide)
+        -> Bulbul TTS  (a short SPOKEN answer)
+        -> on-screen   (the EXACT excerpt / numbers / table rows + source)
 
-Two ways to run it:
+Because the deck is a consolidation, people often want the original wording
+back: exact tables, exact figures, exact phrasing. Reading a table aloud is
+bad TTS, so the answer is split in two:
 
-  1) Browser demo (recommended for the build-a-thon)
-       export SARVAM_API_KEY="sk_..."
-       python voice_qa.py --paper paper.pdf --lang hi-IN --serve
-     Then open http://localhost:8000 and hold the button to speak.
+    spoken  - short, plain, read aloud
+    detail  - verbatim text from the paper, shown on screen (not read aloud)
+    source  - where it came from, e.g. "Section 3.2" or "Table 1"
 
-  2) CLI (for testing without a browser)
-       python voice_qa.py --paper paper.pdf --audio question.wav
+Run
+---
+    export SARVAM_API_KEY="sk-..."
+    python voice_qa.py --paper paper.pdf --deck deck --lang en-IN --serve
+    # open http://localhost:8000  (this serves the deck AND the /ask API)
 
-Stdlib only (http.server) so there is nothing extra to install beyond
-`requests` and `pypdf`, which the main script already needs.
+CLI
+---
+    python voice_qa.py --paper paper.pdf --audio question.wav
 """
 
 from __future__ import annotations
@@ -29,115 +36,67 @@ import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# reuse the verified pipeline
 from research_to_deck import (
-    API_KEY, asr, chat, tts, extract_text,
+    API_KEY, _loads_json, asr, chat, extract_text, tts,
 )
 
 PAPER = ""
 LANG = "en-IN"
+DECK_DIR = os.path.abspath("deck")
+
+SYSTEM = """You are a tutor helping a beginner understand a research paper.
+You are given the FULL PAPER and the SLIDE the user is currently looking at.
+
+Answer the user's question using ONLY the paper. Return ONLY valid JSON:
+{
+  "spoken": "2 to 4 short sentences in plain language, no jargon. This is READ ALOUD to the user.",
+  "detail": "the EXACT supporting text from the paper: verbatim sentences, exact numbers, table rows, or figure values. Plain text, no markdown. Use \\n between lines. Empty string if there is nothing exact.",
+  "source": "where in the paper this came from, e.g. 'Abstract', 'Section 3.2', 'Table 1'. Empty string if unknown."
+}
+
+If the user asks for an exact table, phrase, or number, put it verbatim in
+"detail" and keep "spoken" a one-line pointer to it.
+If the answer is not in the paper, say so honestly in "spoken"."""
+
+USER_TMPL = """FULL PAPER:
+$paper
+
+CURRENT SLIDE:
+Title: $slide_title
+Content: $slide_text
+
+USER QUESTION: $question
+"""
 
 
-def answer(question: str) -> str:
-    """Answer strictly from the paper, in plain language for a beginner."""
-    system = (
-        "You are a friendly tutor for a complete beginner. Answer ONLY using "
-        "the paper below. If the answer is not in the paper, say so honestly. "
-        "Keep it short and spoken-friendly - 2 to 4 sentences, no jargon."
-    )
-    user = f"PAPER:\n{PAPER}\n\nQUESTION: {question}"
-    return chat([
-        {"role": "system", "content": system},
+def answer(question: str, slide_title: str, slide_text: str) -> dict:
+    user = USER_TMPL
+    for k, v in (("$paper", PAPER), ("$slide_title", slide_title or "(none)"),
+                 ("$slide_text", slide_text or "(none)"), ("$question", question)):
+        user = user.replace(k, v)
+    raw = chat([
+        {"role": "system", "content": SYSTEM},
         {"role": "user", "content": user},
     ], temperature=0.3, max_tokens=16000)
+    try:
+        out = _loads_json(raw)
+    except Exception:
+        out = {"spoken": raw.strip(), "detail": "", "source": ""}
+    out.setdefault("spoken", "")
+    out.setdefault("detail", "")
+    out.setdefault("source", "")
+    return out
 
 
 # ---------------------------------------------------------------------------
-# browser UI
+# HTTP: serves the deck statically + the /ask API
 # ---------------------------------------------------------------------------
-PAGE = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Ask the paper</title>
-<style>
-  body { font-family: system-ui, sans-serif; max-width: 680px; margin: 60px auto;
-         padding: 0 20px; color: #212529; }
-  h1 { font-size: 22px; }
-  button { font-size: 17px; padding: 14px 26px; border-radius: 10px;
-           border: none; background: #3b5bdb; color: #fff; cursor: pointer; }
-  button:disabled { background: #adb5bd; }
-  #out { margin-top: 26px; line-height: 1.55; }
-  .q { color: #868e96; font-style: italic; }
-  .a { margin-top: 8px; }
-  .status { color: #adb5bd; font-size: 14px; margin-left: 12px; }
-</style></head>
-<body>
-  <h1>Ask the paper</h1>
-  <p>Hold the button, ask your question out loud, then release.</p>
-  <button id="btn">Hold to speak</button><span class="status" id="st"></span>
-  <div id="out"></div>
-<script>
-let ctx, stream, src, node, chunks = [], recording = false;
-const btn = document.getElementById('btn');
-const st = document.getElementById('st');
-const out = document.getElementById('out');
-
-function setStatus(s){ st.textContent = s; }
-
-async function start() {
-  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-  src = ctx.createMediaStreamSource(stream);
-  node = ctx.createScriptProcessor(4096, 1, 1);
-  chunks = [];
-  node.onaudioprocess = e => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-  src.connect(node); node.connect(ctx.destination);
-  recording = true;
-  setStatus('listening...');
+CTYPES = {
+    ".html": "text/html; charset=utf-8", ".wav": "audio/wav",
+    ".mp3": "audio/mpeg", ".json": "application/json",
+    ".js": "text/javascript", ".css": "text/css",
+    ".png": "image/png", ".svg": "image/svg+xml",
 }
-
-function encodeWav(samples, rate) {
-  const len = samples.reduce((a, c) => a + c.length, 0);
-  const buf = new ArrayBuffer(44 + len * 2);
-  const v = new DataView(buf);
-  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  ws(0, 'RIFF'); v.setUint32(4, 36 + len * 2, true); ws(8, 'WAVE');
-  ws(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
-  v.setUint16(22, 1, true); v.setUint32(24, rate, true);
-  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-  ws(36, 'data'); v.setUint32(40, len * 2, true);
-  let o = 44;
-  for (const c of samples) for (const s of c) {
-    const x = Math.max(-1, Math.min(1, s));
-    v.setInt16(o, x < 0 ? x * 0x8000 : x * 0x7fff, true); o += 2;
-  }
-  return new Blob([buf], { type: 'audio/wav' });
-}
-
-async function stop() {
-  if (!recording) return;
-  recording = false;
-  node.disconnect(); src.disconnect();
-  stream.getTracks().forEach(t => t.stop());
-  setStatus('thinking...');
-  const wav = encodeWav(chunks, 16000);
-  try {
-    const res = await fetch('/ask', { method: 'POST', body: wav });
-    const j = await res.json();
-    if (j.error) { setStatus('error'); out.innerHTML = '<b>' + j.error + '</b>'; return; }
-    out.innerHTML = '<div class="q">You asked: ' + j.transcript + '</div>' +
-                    '<div class="a">' + j.answer + '</div>';
-    setStatus('');
-    const audio = new Audio('data:audio/wav;base64,' + j.audio);
-    audio.play();
-  } catch (e) { setStatus('failed'); out.textContent = String(e); }
-}
-
-btn.addEventListener('mousedown', start);
-btn.addEventListener('mouseup', stop);
-btn.addEventListener('mouseleave', stop);
-btn.addEventListener('touchstart', e => { e.preventDefault(); start(); });
-btn.addEventListener('touchend', e => { e.preventDefault(); stop(); });
-</script></body></html>
-"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -149,46 +108,61 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
-        else:
-            self._send(404, b'{"error":"not found"}')
+        rel = self.path.split("?", 1)[0].lstrip("/") or "index.html"
+        full = os.path.abspath(os.path.join(DECK_DIR, rel))
+        if not full.startswith(DECK_DIR) or not os.path.isfile(full):
+            return self._send(404, b"not found", "text/plain")
+        ext = os.path.splitext(full)[1].lower()
+        with open(full, "rb") as f:
+            self._send(200, f.read(), CTYPES.get(ext, "application/octet-stream"))
 
     def do_POST(self):
         if self.path != "/ask":
             return self._send(404, b'{"error":"not found"}')
-        n = int(self.headers.get("Content-Length", 0))
-        data = self.rfile.read(n)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(data)
-            path = f.name
         try:
-            q = asr(path, mode="codemix").get("transcript", "")
+            n = int(self.headers.get("Content-Length", 0))
+            req = json.loads(self.rfile.read(n) or b"{}")
+            audio_b64 = req.get("audio", "")
+            slide_title = req.get("slide_title", "")
+            slide_text = req.get("slide_text", "")
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(base64.b64decode(audio_b64))
+                path = f.name
+            try:
+                q = asr(path, mode="codemix").get("transcript", "")
+            finally:
+                os.unlink(path)
+
             if not q.strip():
-                return self._send(200, json.dumps(
-                    {"transcript": "", "answer": "I did not catch that - try again.",
-                     "audio": ""}).encode())
-            ans = answer(q)
-            audio = tts(ans, LANG)
-            self._send(200, json.dumps({
-                "transcript": q, "answer": ans,
+                return self._send(200, json.dumps({
+                    "transcript": "",
+                    "spoken": "I did not catch that - try again.",
+                    "detail": "", "source": "", "audio": ""}).encode())
+
+            res = answer(q, slide_title, slide_text)
+            audio = tts(res["spoken"], LANG)
+            return self._send(200, json.dumps({
+                "transcript": q,
+                "spoken": res["spoken"],
+                "detail": res["detail"],
+                "source": res["source"],
                 "audio": base64.b64encode(audio).decode(),
             }).encode())
         except Exception as e:  # keep the demo alive on any single failure
-            self._send(500, json.dumps({"error": str(e)}).encode())
-        finally:
-            os.unlink(path)
+            return self._send(500, json.dumps({"error": str(e)}).encode())
 
-    def log_message(self, *args):  # quieter logs
+    def log_message(self, *args):
         pass
 
 
 def main():
-    global PAPER, LANG
+    global PAPER, LANG, DECK_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--paper", required=True, help="the PDF the questions are about")
+    ap.add_argument("--deck", default="deck", help="folder with index.html + audio")
     ap.add_argument("--lang", default="en-IN")
-    ap.add_argument("--serve", action="store_true", help="start the web server")
+    ap.add_argument("--serve", action="store_true", help="serve the deck + /ask API")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--audio", help="CLI mode: a wav file to ask")
     args = ap.parse_args()
@@ -198,23 +172,31 @@ def main():
 
     PAPER = extract_text(args.paper)
     LANG = args.lang
+    DECK_DIR = os.path.abspath(args.deck)
 
     if args.audio:
         q = asr(args.audio, mode="codemix").get("transcript", "")
         print("Q:", q)
-        ans = answer(q)
-        print("A:", ans)
+        res = answer(q, "", "")
+        print("A (spoken):", res["spoken"])
+        if res["detail"]:
+            print("  detail:", res["detail"][:300])
+        if res["source"]:
+            print("  source:", res["source"])
         with open("answer.wav", "wb") as f:
-            f.write(tts(ans, LANG))
+            f.write(tts(res["spoken"], LANG))
         print("wrote answer.wav")
         return
 
     if args.serve:
-        print(f"serving on http://localhost:{args.port}  (Ctrl+C to stop)")
+        if not os.path.isfile(os.path.join(DECK_DIR, "index.html")):
+            sys.exit(f"no index.html in {DECK_DIR} - build the deck first "
+                     "(python research_to_deck.py paper.pdf --outdir deck)")
+        print(f"deck + Q&A on http://localhost:{args.port}  (Ctrl+C to stop)")
         ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
         return
 
-    ap.error("pass --serve (browser) or --audio file.wav (CLI)")
+    ap.error("pass --serve (deck + browser Q&A) or --audio file.wav (CLI)")
 
 
 if __name__ == "__main__":

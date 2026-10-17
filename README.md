@@ -18,7 +18,7 @@ PDF ──► text ──► Sarvam-105B outline ──► Bulbul narration ─�
 | File | What it is |
 |------|------------|
 | `research_to_deck.py` | The main pipeline. PDF in → narrated HTML deck out. |
-| `voice_qa.py` | Stretch feature: ask the paper questions by voice (browser or CLI). |
+| `voice_qa.py` | Per-slide voice Q&A: ask about the slide you are on; get a spoken answer plus the exact excerpt. |
 | `sample_deck.zip` | A real deck this code produced from a test paper — open `index.html`. |
 
 ## Repo layout
@@ -59,13 +59,28 @@ python research_to_deck.py paper.pdf --lang ta-IN --translate --outdir deck
 open deck/index.html        # or just double-click the file
 ```
 
-Then the stretch:
+## Ask about a slide (voice Q&A)
+
+The deck has a **"Ask about this slide"** button on every slide. Hold it, ask a
+question out loud, and you get three things:
+
+- a short **spoken** answer (played aloud, in your language),
+- the **exact excerpt** from the paper - verbatim wording, numbers, table rows -
+  shown on screen (reading a table aloud makes bad TTS, so this part is visual),
+- the **source** it came from (e.g. "Section 3.2", "Table 1").
+
+The Q&A is scoped to the slide you are on, so "what does this mean?" resolves
+to the right thing. It needs the server, which serves the deck and the API
+from one origin:
 
 ```bash
-# browser demo: hold the button, ask out loud
-python voice_qa.py --paper paper.pdf --lang hi-IN --serve   # → http://localhost:8000
+python voice_qa.py --paper paper.pdf --deck deck --lang en-IN --serve
+# open http://localhost:8000   (serve the deck this way, not via file://)
+```
 
-# or test from the CLI
+CLI, for testing without a browser:
+
+```bash
 python voice_qa.py --paper paper.pdf --audio question.wav
 ```
 
@@ -73,7 +88,7 @@ python voice_qa.py --paper paper.pdf --audio question.wav
 
 | Call | Endpoint | Model | Role |
 |------|----------|-------|------|
-| Chat | `POST /v1/chat/completions` | `sarvam-105b` | outline + Q&A answers |
+| Chat | `POST /v1/chat/completions` | `sarvam-105b` | outline + slide-scoped Q&A |
 | TTS | `POST /text-to-speech` | `bulbul:v3` / `bulbul:v4-flash` | slide narration |
 | STT | `POST /speech-to-text` | `saaras:v4` | transcribe spoken questions |
 | Translate | `POST /translate` | `mayura:v1` | localise the deck |
