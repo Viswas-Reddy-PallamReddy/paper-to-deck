@@ -1,178 +1,181 @@
-# Paper → Narrated Deck (Sarvam APIs)
+# Paper → Deck
 
-Upload a research paper, get a **self-explaining slide deck**: each slide has
-beginner-friendly bullets, an optional auto-generated infographic, and
-**spoken narration in an Indian language**. Then let people **talk to the paper**.
+**Turn a research paper into a narrated, multilingual slide deck — then let people ask it questions out loud.**
 
-Everything is built on Sarvam APIs and **verified end-to-end** against the live
-API before delivery.
+Paper → Deck reads a PDF research paper and produces a presentation that explains
+itself: every slide is written for a beginner, illustrated with an auto-generated
+visual, and narrated aloud in one of eleven Indian languages. A reader who wants
+more can hold a button on any slide and ask a question by voice — the answer is
+spoken back, with the exact excerpt from the original paper shown on screen.
+
+Built on [Sarvam AI](https://www.sarvam.ai)'s language stack.
+
+---
+
+## Why
+
+Research papers are written for specialists. The people who need the findings —
+students, journalists, policymakers, practitioners in an adjacent field, anyone
+not fluent in English — are usually the ones least able to get through them.
+Most tools translate the words; they do not make the paper *understandable*.
+
+Paper → Deck closes that gap in three ways:
+
+- **Simplifies** — restructures the paper into beginner-friendly slides
+- **Speaks** — narrates every slide in the reader's own language
+- **Answers** — turns the deck into a conversation, backed by verbatim evidence
+
+## Features
+
+- **Narrated deck** — 6–8 slides, each with plain-language bullets and a spoken
+  explanation generated with natural Indian-language voices.
+- **Multilingual** — narration and answers in Hindi, Bengali, Tamil, Telugu,
+  Marathi, Gujarati, Kannada, Malayalam, Punjabi, Odia, and English.
+- **Automatic visuals** — the model selects a chart, timeline, comparison, or
+  flow diagram for each slide and supplies its data.
+- **Per-slide voice Q&A** — hold to ask a question; the answer is scoped to the
+  slide you are viewing.
+- **Answers with evidence** — a short spoken answer, plus the exact excerpt
+  (figures, table rows, wording) and the section it came from.
+- **Two interfaces** — an interactive web app, and a command-line tool for
+  batch generation.
+
+## How it works
+
+Two loops, both built on Sarvam APIs.
+
+**Build the deck**
 
 ```
-PDF ──► text ──► Sarvam-105B outline ──► Bulbul narration ──► reveal.js deck
-                                       └► (optional) Mayura translation
-                          voice:  mic ──► Saaras ASR ──► 105B answer ──► Bulbul
+PDF ──► extract text ──► structure into slides ──► narrate each slide ──► HTML deck
+                         (Sarvam-105B)              (Bulbul TTS)
 ```
 
-## Files
+The model reads the paper and returns a structured outline: for each slide, a
+title, beginner-level bullets, a spoken narration script, and a suggested visual
+with its data. Each narration is synthesised to audio, and the deck is rendered
+as a self-contained HTML page with the visuals and audio embedded.
 
-| File | What it is |
-|------|------------|
-| `research_to_deck.py` | The main pipeline. PDF in → narrated HTML deck out. |
-| `voice_qa.py` | Per-slide voice Q&A: ask about the slide you are on; get a spoken answer plus the exact excerpt. |
-| `sample_deck.zip` | A real deck this code produced from a test paper — open `index.html`. |
-
-## Repo layout
+**Talk to the deck**
 
 ```
-research_to_deck.py   main pipeline (PDF -> narrated deck)
-voice_qa.py           stretch: ask the paper by voice
-sample_deck.zip       a real generated deck - unzip and open index.html
-requirements.txt      requests, pypdf
-.env.example          copy to .env, add your key
-demo.sh               one-command smoke test
+mic ──► transcribe ──► answer from paper + current slide ──► spoken answer
+        (Saaras)        (Sarvam-105B)                        (Bulbul)
+                                             + exact excerpt shown on screen
 ```
 
-## Setup
+A spoken question is transcribed, answered using the full paper and the slide in
+view, and the reply is spoken back. Because the deck is a summary, the answer
+also returns the verbatim supporting text from the original — so a reader can
+check the exact figure or wording without leaving the slide.
+
+## Who it helps
+
+- **Students and newcomers** meeting a field for the first time
+- **Non-English readers** who need the content in their own language
+- **Researchers** skimming work outside their speciality
+- **Educators** turning a paper into teaching material
+- **Accessibility** — the deck can be listened to and navigated entirely by voice
+
+## Tech stack
+
+| Layer | Choice |
+|-------|--------|
+| Language, speech & reasoning | [Sarvam AI](https://www.sarvam.ai) — Sarvam-105B, Bulbul (TTS), Saaras (ASR), Mayura (translation) |
+| Backend | Python, FastAPI, Uvicorn |
+| Frontend | Vanilla HTML / CSS / JavaScript single-page app |
+| Deck rendering | HTML with inline SVG visuals |
+| PDF parsing | pypdf |
+
+### Sarvam APIs used
+
+| Capability | Endpoint | Model |
+|------------|----------|-------|
+| Chat & reasoning | `POST /v1/chat/completions` | `sarvam-105b` |
+| Text to speech | `POST /text-to-speech` | `bulbul:v3` |
+| Speech to text | `POST /speech-to-text` | `saaras:v4` |
+| Translation | `POST /translate` | `mayura:v1` |
+| Language identification | `POST /text-lid` | — |
+
+## Getting started
+
+**Prerequisites**
+
+- Python 3.10 or newer
+- A Sarvam AI API key from [dashboard.sarvam.ai](https://dashboard.sarvam.ai)
 
 ```bash
-git clone <your-repo-url> && cd paper-to-deck
+git clone <repo-url> && cd paper-to-deck
 pip install -r requirements.txt
-cp .env.example .env          # then edit .env and paste your key
-export SARVAM_API_KEY="sk-..."   # or: set -a; source .env; set +a
-```
-
-Never commit `.env` - it is already in `.gitignore`.
-
-## Run
-
-```bash
-# core: build a narrated deck (English)
-python research_to_deck.py paper.pdf --lang en-IN --outdir deck
-
-# same, in Hindi (the LLM writes and Bulbul speaks in Hindi)
-python research_to_deck.py paper.pdf --lang hi-IN --outdir deck
-
-# build in English, then localise via the Translate API
-python research_to_deck.py paper.pdf --lang ta-IN --translate --outdir deck
-
-# open it
-open deck/index.html        # or just double-click the file
-```
-
-## Ask about a slide (voice Q&A)
-
-The deck has a **"Ask about this slide"** button on every slide. Hold it, ask a
-question out loud, and you get three things:
-
-- a short **spoken** answer (played aloud, in your language),
-- the **exact excerpt** from the paper - verbatim wording, numbers, table rows -
-  shown on screen (reading a table aloud makes bad TTS, so this part is visual),
-- the **source** it came from (e.g. "Section 3.2", "Table 1").
-
-The Q&A is scoped to the slide you are on, so "what does this mean?" resolves
-to the right thing. It needs the server, which serves the deck and the API
-from one origin:
-
-```bash
-python voice_qa.py --paper paper.pdf --deck deck --lang en-IN --serve
-# open http://localhost:8000   (serve the deck this way, not via file://)
-```
-
-CLI, for testing without a browser:
-
-```bash
-python voice_qa.py --paper paper.pdf --audio question.wav
-```
-
-## Deploy to Vercel
-
-Vercel hosts two things: the **deck** (static, from `public/`) and the **`/ask`**
-Q&A as a Python serverless function. The generator does *not* run on Vercel - it
-is a long batch job - so you build the deck locally and deploy the output.
-
-```bash
-npm i -g vercel                              # once
+cp .env.example .env          # then paste your key into .env
 export SARVAM_API_KEY="sk-..."
-bash prepare_vercel.sh paper.pdf en-IN       # builds public/, stages api/paper.txt
-vercel --prod                                # deploy
 ```
 
-Then set the env var in the Vercel dashboard (Settings -> Environment Variables):
+### Run the web app
 
-| Variable | Required | Purpose |
-|----------|----------|---------|
-| `SARVAM_API_KEY` | yes | auth for every Sarvam call |
-| `QA_LANG` | no | answer language (default `en-IN`) |
-| `PAPER_TEXT` | no | overrides `api/paper.txt` if you would rather not commit the paper text |
-
-What maps to what:
-
-```
-public/       -> static deck served at /        (vercel.json: outputDirectory)
-api/ask.py    -> POST /api/ask, rewritten from /ask
-vercel.json   -> the rewrite + maxDuration: 60
+```bash
+uvicorn app.main:app --reload --port 8000
+# open http://localhost:8000
 ```
 
-Two limits to know:
+Drop in a PDF, choose a narration language, and press **Generate deck**.
+Generation runs in the background; the page shows progress and then the
+finished deck, ready to read, listen to, and question.
 
-- **Function timeout.** `/ask` does ASR + LLM + TTS in a single request. Vercel
-  Hobby caps a function at 60s; if it times out, move the backend to a host that
-  runs a long-lived server (Render, Railway, Fly) - `voice_qa.py` runs there
-  almost unchanged - and keep the static deck on Vercel.
-- **Request size.** Audio is sent base64 in the body; keep clips short (a few
-  seconds) to stay well under Vercel's body limit.
+### Run from the command line
 
-## Sarvam APIs used (all confirmed working)
+```bash
+python research_to_deck.py paper.pdf --lang en-IN --outdir deck
+open deck/index.html
+```
 
-| Call | Endpoint | Model | Role |
-|------|----------|-------|------|
-| Chat | `POST /v1/chat/completions` | `sarvam-105b` | outline + slide-scoped Q&A |
-| TTS | `POST /text-to-speech` | `bulbul:v3` / `bulbul:v4-flash` | slide narration |
-| STT | `POST /speech-to-text` | `saaras:v4` | transcribe spoken questions |
-| Translate | `POST /translate` | `mayura:v1` | localise the deck |
-| Lang ID | `POST /text-lid` | — | detect language of input |
+`--lang` sets the narration language, and `--translate` builds in English first
+and then localises the deck through the translation API.
 
-## Gotchas found while building (save yourself the debugging)
+## API
 
-1. **`sarvam-105b` is a reasoning model.** It spends thousands of *reasoning*
-   tokens before it answers. A long prompt with the default token budget returns
-   `content: null` with `finish_reason: "length"`. The outline task needed
-   **~14,000** completion tokens. The code sets `max_tokens=16000` (retries up to
-   32000) and adds a "output only JSON" system prompt to curb over-thinking.
-   If you see empty answers, this is why.
-2. **STT needs an explicit MIME type.** The multipart part must be
-   `("file.wav", handle, "audio/wav")` or the API replies
-   `Invalid file type: None`.
-3. **REST caps.** STT REST handles ≤ 30 s (use the Batch API for longer);
-   TTS REST caps at 2,500 characters per request. The code truncates narration
-   at 2,400 to be safe.
-4. **TTS quality drops on romanised Indic.** Write Hindi/Tamil etc. in **native
-   script** (`आपका OTP`), not Latin letters — the model handles code-mixing fine
-   as long as each language keeps its own script.
-5. **`bulbul:v3` vs `bulbul:v4-flash`.** Same request shape. v4-flash is newer
-   with a persona voice catalog — if you switch, pick a v4 speaker id (e.g.
-   `shubh_enhi_ads`); the v3 name `shubh` is not valid on v4. The code handles
-   this automatically.
-6. **Scanned PDFs.** If `pypdf` extracts almost nothing, the paper is a scan —
-   route it through **Sarvam Vision** (document intelligence / OCR) first.
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/generate` | Upload a PDF and a language; returns a job id |
+| `GET` | `/api/jobs/{id}` | Job status and progress |
+| `GET` | `/api/decks/{id}/deck.json` | The generated deck |
+| `GET` | `/api/decks/{id}/audio/{name}` | Slide narration audio |
+| `POST` | `/api/ask` | Spoken question → spoken answer with excerpt |
 
-## 40-minute build plan
+## Project structure
 
-| Time | Do |
-|------|-----|
-| 0–5 | `export` the key, `pip install`, run `research_to_deck.py` once on any PDF to prove the APIs work. |
-| 5–15 | Swap in your own deck theme / branding. Tweak the outline prompt for your paper. |
-| 15–25 | Pre-generate + cache the demo paper's deck so the live demo can't stall. |
-| 25–35 | Wire `voice_qa.py --serve` into the same page as the deck. |
-| 35–40 | Rehearse: open deck → narrate → ask one question by voice. |
+```
+app/                  full-stack web app
+  main.py             FastAPI backend
+  static/             single-page front-end
+research_to_deck.py   generation pipeline (CLI and library)
+voice_qa.py           standalone local server for Q&A
+api/ask.py            serverless Q&A function
+vercel.json           deployment configuration
+sample_deck.zip       an example generated deck
+```
 
-**Insurance:** every stage caches. `outline.json` and the `.wav` files are reused
-on re-run, so if the network hiccups on stage you still have a full deck.
+## Deployment
 
-## Where to extend (name these in the pitch as roadmap)
+The deck is static and the Q&A is a single request, so both run on Vercel; the
+generator runs locally, or anywhere that supports longer-running jobs.
 
-- Voice *editing* of the deck ("add a slide on the methodology") — constrain to a
-  small intent set + always confirm by voice before committing.
-- Live multilingual interpretation: streaming Saaras → Bulbul for real-time dubbing.
-- Voice cloning (Bulbul Instant Voice Cloning) to narrate in a chosen voice.
-- "Explain simpler / go deeper" as a voice command that re-prompts and re-narrates.
+```bash
+npm i -g vercel
+bash prepare_vercel.sh paper.pdf en-IN
+vercel --prod
+```
+
+Set `SARVAM_API_KEY` in the project's environment variables.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SARVAM_API_KEY` | — | Sarvam API key (required) |
+| `QA_LANG` | `en-IN` | Answer language for the serverless Q&A function |
+| `DECKS_DIR` | `data/decks` | Where generated decks are written |
+
+## License
+
+Released under the MIT License — see [LICENSE](LICENSE).

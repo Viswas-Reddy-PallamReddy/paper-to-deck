@@ -1,0 +1,70 @@
+:root{
+  --accent:#3b5bdb; --accent-dark:#2f49b0; --bg:#f8f9fa; --card:#fff;
+  --text:#212529; --muted:#868e96; --line:#e9ecef; --danger:#e03131;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+     background:var(--bg);color:var(--text);line-height:1.5}
+.topbar{display:flex;align-items:center;gap:12px;padding:14px 22px;background:#fff;
+        border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+.logo{width:26px;height:26px;border-radius:7px;background:var(--accent);
+      display:grid;place-items:center;color:#fff;font-weight:700;font-size:14px}
+.topbar h1{font-size:16px;margin:0;font-weight:600}
+.spacer{flex:1}
+button.ghost{background:none;border:1px solid var(--line);color:var(--muted);
+             border-radius:8px;padding:7px 14px;cursor:pointer;font-size:13px}
+main{max-width:920px;margin:0 auto;padding:28px 20px 80px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px}
+
+.drop{border:2px dashed #ced4da;border-radius:12px;padding:44px 20px;text-align:center;
+      cursor:pointer;transition:.15s;background:#fcfcfd}
+.drop.over{border-color:var(--accent);background:#f1f4ff}
+.drop strong{display:block;font-size:16px;margin-bottom:6px}
+.drop span{color:var(--muted);font-size:13px}
+.row{display:flex;gap:14px;align-items:flex-end;margin-top:20px;flex-wrap:wrap}
+label{font-size:13px;color:var(--muted);display:block;margin-bottom:5px}
+select{font:inherit;padding:9px 12px;border:1px solid var(--line);border-radius:9px;background:#fff}
+button.primary{background:var(--accent);color:#fff;border:none;border-radius:9px;
+               padding:11px 22px;font-size:14px;font-weight:600;cursor:pointer}
+button.primary:hover:not(:disabled){background:var(--accent-dark)}
+button.primary:disabled{background:#adb5bd;cursor:default}
+.file-name{margin-top:12px;font-size:13px}
+.progress{margin-top:22px}
+.bar{height:8px;background:var(--line);border-radius:99px;overflow:hidden}
+.bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .4s}
+.progress p{margin:10px 0 0;font-size:13px;color:var(--muted)}
+.error{color:var(--danger);font-size:13px;margin-top:12px}
+
+.slide-head{display:flex;justify-content:space-between;align-items:baseline;gap:16px}
+.slide-head h2{margin:0;font-size:22px}
+.slide-head .count{color:var(--muted);font-size:13px;white-space:nowrap}
+.slide-card ul{margin:16px 0 0;padding-left:20px}
+.slide-card li{margin:7px 0}
+.slide-card .viz{width:100%;max-height:320px;margin-top:16px}
+.viz-label{font-size:14px;fill:#343a40;font-family:sans-serif}
+.viz-val{font-size:14px;fill:var(--accent);font-weight:600;font-family:sans-serif}
+.viz-title{font-size:16px;fill:#212529;font-weight:700;font-family:sans-serif}
+.viz-step{font-size:13px;fill:#fff;font-weight:700;font-family:sans-serif}
+.audio-row{display:flex;align-items:center;gap:12px;margin-top:18px}
+.audio-row audio{flex:1}
+.nav{display:flex;align-items:center;gap:12px;margin-top:22px}
+.nav button{background:#fff;border:1px solid var(--line);border-radius:9px;
+            padding:9px 16px;cursor:pointer;font-size:14px}
+.nav button:disabled{opacity:.45;cursor:default}
+.dots{display:flex;gap:6px;flex:1;justify-content:center;flex-wrap:wrap}
+.dot{width:9px;height:9px;border-radius:50%;background:#ced4da;cursor:pointer}
+.dot.on{background:var(--accent)}
+
+.qa{margin-top:22px;border-top:1px solid var(--line);padding-top:20px}
+.qa-actions{display:flex;align-items:center;gap:12px}
+.rec{background:var(--accent);color:#fff;border:none;border-radius:9px;
+     padding:11px 20px;font-size:14px;font-weight:600;cursor:pointer}
+.rec.live{background:var(--danger)}
+.qa-status{font-size:13px;color:var(--muted)}
+.qa-out{margin-top:16px;font-size:14px}
+.qa-out .q{color:var(--muted);font-style:italic;margin-bottom:8px}
+.qa-out .detail{margin-top:10px;padding:12px 14px;background:#f8f9fa;
+                border-left:3px solid var(--accent);white-space:pre-wrap;
+                border-radius:0 8px 8px 0;font-size:13px}
+.qa-out .src{color:var(--muted);font-size:12px;margin-top:6px}
+.hidden{display:none}

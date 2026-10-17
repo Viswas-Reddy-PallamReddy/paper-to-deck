@@ -617,8 +617,103 @@ def render_html(outline: dict, audio_files: list[str], out_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Q&A over the paper (shared by the web app and the local server)
+# ---------------------------------------------------------------------------
+QA_SYSTEM = """You are a tutor helping a beginner understand a research paper.
+You are given the FULL PAPER and the SLIDE the user is currently looking at.
+
+Answer the user's question using ONLY the paper. Return ONLY valid JSON:
+{
+  "spoken": "2 to 4 short sentences in plain language, no jargon. This is READ ALOUD to the user.",
+  "detail": "the EXACT supporting text from the paper: verbatim sentences, exact numbers, table rows, or figure values. Plain text, no markdown. Use \\n between lines. Empty string if there is nothing exact.",
+  "source": "where in the paper this came from, e.g. 'Abstract', 'Section 3.2', 'Table 1'. Empty string if unknown."
+}
+
+If the user asks for an exact table, phrase, or number, put it verbatim in
+"detail" and keep "spoken" a one-line pointer to it.
+If the answer is not in the paper, say so honestly in "spoken"."""
+
+
+def answer_from_paper(paper: str, question: str, slide_title: str = "",
+                      slide_text: str = "") -> dict:
+    """Answer a question grounded in the paper + the current slide.
+
+    Returns {spoken, detail, source}: a short answer to read aloud, the exact
+    excerpt to show on screen, and where it came from.
+    """
+    user = (f"FULL PAPER:\n{paper}\n\nCURRENT SLIDE:\n"
+            f"Title: {slide_title or '(none)'}\n"
+            f"Content: {slide_text or '(none)'}\n\n"
+            f"USER QUESTION: {question}")
+    raw = chat([
+        {"role": "system", "content": QA_SYSTEM},
+        {"role": "user", "content": user},
+    ], temperature=0.3, max_tokens=16000)
+    try:
+        out = _loads_json(raw)
+    except Exception:
+        out = {"spoken": raw.strip(), "detail": "", "source": ""}
+    for k in ("spoken", "detail", "source"):
+        out.setdefault(k, "")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def generate_deck(paper_path: str, outdir: str, *, lang: str = "en-IN",
+                  speaker: str | None = None, model: str = TTS_MODEL_DEFAULT,
+                  translate: bool = False, progress=None) -> dict:
+    """Run the full pipeline, optionally reporting progress.
+
+    progress(stage: str, pct: int, message: str) is called at each step, so a
+    web backend can stream status to the browser. Returns the outline plus the
+    audio file names.
+    """
+    def say(stage, pct, msg):
+        if progress:
+            progress(stage, pct, msg)
+
+    os.makedirs(outdir, exist_ok=True)
+
+    say("extract", 5, "Reading the PDF...")
+    paper = extract_text(paper_path)
+    # keep the raw text next to the deck - the Q&A endpoint uses it as context
+    with open(os.path.join(outdir, "paper.txt"), "w", encoding="utf-8") as f:
+        f.write(paper)
+    say("extract", 15, f"{len(paper)} characters of text")
+
+    say("outline", 25, "Structuring the deck with Sarvam-105B...")
+    outline = build_outline(paper, "en-IN" if translate else lang)
+
+    if translate and lang != "en-IN":
+        say("translate", 40, f"Localising to {lang}...")
+        outline = localise(outline, lang)
+
+    with open(os.path.join(outdir, "outline.json"), "w", encoding="utf-8") as f:
+        json.dump(outline, f, ensure_ascii=False, indent=2)
+
+    slides = outline["slides"]
+    total = max(len(slides), 1)
+    say("narrate", 45, f"Narrating {len(slides)} slides with Bulbul...")
+    audio_files = []
+    for i, slide in enumerate(slides, 1):
+        name = f"slide{i:02d}.wav"
+        path = os.path.join(outdir, name)
+        if not os.path.exists(path):
+            audio = tts(slide.get("narration", slide.get("title", "")),
+                        lang, speaker=speaker, model=model)
+            with open(path, "wb") as f:
+                f.write(audio)
+        audio_files.append(name)
+        say("narrate", 45 + int(45 * i / total), f"Narrated slide {i} of {len(slides)}")
+
+    say("render", 92, "Rendering the deck...")
+    render_html(outline, audio_files, os.path.join(outdir, "index.html"))
+    say("done", 100, "Ready")
+    return {"outline": outline, "audio_files": audio_files, "paper": paper}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Research paper -> narrated deck")
     ap.add_argument("pdf", help="path to the paper (.pdf or .txt)")
@@ -635,37 +730,12 @@ def main():
     if not API_KEY:
         sys.exit("Set SARVAM_API_KEY first (get one at dashboard.sarvam.ai).")
 
-    os.makedirs(args.outdir, exist_ok=True)
+    def _p(stage, pct, msg):
+        print(f"[{pct:3d}%] {msg}")
 
-    print("[1/5] extracting text from PDF...")
-    paper = extract_text(args.pdf)
-    print(f"      {len(paper)} characters")
-    # keep the raw text next to the deck - the Q&A server / serverless
-    # function uses it as grounding context
-    with open(os.path.join(args.outdir, "paper.txt"), "w", encoding="utf-8") as f:
-        f.write(paper)
-
-    print("[2/5] building the outline with Sarvam-105B...")
-    outline = build_outline(paper, "en-IN" if args.translate else args.lang)
-    print(f"      {len(outline['slides'])} slides")
-
-    if args.translate and args.lang != "en-IN":
-        print(f"[2b ] localising to {args.lang} via Translate API...")
-        outline = localise(outline, args.lang)
-
-    with open(os.path.join(args.outdir, "outline.json"), "w", encoding="utf-8") as f:
-        json.dump(outline, f, ensure_ascii=False, indent=2)
-
-    print("[3/5] synthesising narration with Bulbul...")
-    audio_files = synthesise(outline, args.lang, args.outdir,
-                             speaker=args.speaker, model=args.model)
-
-    print("[4/5] rendering the deck...")
-    index = os.path.join(args.outdir, "index.html")
-    render_html(outline, audio_files, index)
-
-    print("[5/5] done.")
-    print(f"      open: {index}")
+    generate_deck(args.pdf, args.outdir, lang=args.lang, speaker=args.speaker,
+                  model=args.model, translate=args.translate, progress=_p)
+    print(f"      open: {os.path.join(args.outdir, 'index.html')}")
 
 
 if __name__ == "__main__":

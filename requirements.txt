@@ -1,2 +1,7 @@
 requests>=2.31
 pypdf>=4.0
+
+# full-stack web app (app/)
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9
