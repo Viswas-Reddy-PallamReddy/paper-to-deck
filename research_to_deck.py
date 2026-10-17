@@ -1,0 +1,558 @@
+"""
+research_to_deck.py
+===================
+Turn a research paper (PDF) into a narrated, self-explaining slide deck,
+built end-to-end on Sarvam APIs.
+
+Pipeline
+--------
+    PDF  -> text (pypdf)
+         -> structured outline           [Sarvam-105B chat]
+         -> optional translation          [Mayura / Sarvam-Translate]
+         -> per-slide narration audio     [Bulbul TTS]
+         -> reveal.js HTML deck with inline SVG visuals + autoplay audio
+
+Sarvam APIs used:
+    POST /v1/chat/completions   sarvam-105b      outline + Q&A
+    POST /text-to-speech        bulbul:v3        narration audio
+    POST /translate             mayura:v1        optional localisation
+    POST /text-lid              -                detect language of input
+
+Run
+---
+    export SARVAM_API_KEY="sk_..."          # never hard-code the key
+    pip install requests pypdf
+    python research_to_deck.py paper.pdf --lang hi-IN --outdir deck
+    # then open deck/index.html in a browser
+
+Every network call is retried and every stage caches to disk, so a demo
+never dies on a flaky minute.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import time
+from string import Template
+
+import requests
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+BASE = "https://api.sarvam.ai"
+API_KEY = os.environ.get("SARVAM_API_KEY", "")
+
+CHAT_MODEL = "sarvam-105b"
+TTS_MODEL_DEFAULT = "bulbul:v3"      # stable; "bulbul:v4-flash" is newer
+TRANSLATE_MODEL = "mayura:v1"        # 11 langs; "sarvam-translate:v1" for 23
+
+# Language codes we accept for narration (subset; extend as needed).
+LANG_NAMES = {
+    "en-IN": "English", "hi-IN": "Hindi", "bn-IN": "Bengali",
+    "ta-IN": "Tamil", "te-IN": "Telugu", "mr-IN": "Marathi",
+    "gu-IN": "Gujarati", "kn-IN": "Kannada", "ml-IN": "Malayalam",
+    "pa-IN": "Punjabi", "od-IN": "Odia",
+}
+
+
+# ---------------------------------------------------------------------------
+# tiny API client with retries
+# ---------------------------------------------------------------------------
+class SarvamError(RuntimeError):
+    pass
+
+
+def _post(path: str, *, json_body=None, files=None, data=None, headers=None,
+          tries: int = 3, timeout: int = 120):
+    url = f"{BASE}{path}"
+    h = {"api-subscription-key": API_KEY}
+    if headers:
+        h.update(headers)
+    last = None
+    for attempt in range(1, tries + 1):
+        try:
+            r = requests.post(url, headers=h, json=json_body, files=files,
+                              data=data, timeout=timeout)
+            if r.status_code >= 500 and attempt < tries:
+                last = f"{r.status_code}: {r.text[:200]}"
+                time.sleep(1.5 * attempt)
+                continue
+            if r.status_code != 200:
+                raise SarvamError(f"{path} -> {r.status_code}: {r.text[:300]}")
+            return r.json()
+        except (requests.RequestException, SarvamError) as e:
+            last = str(e)
+            if isinstance(e, SarvamError):
+                raise
+            if attempt < tries:
+                time.sleep(1.5 * attempt)
+                continue
+            raise SarvamError(f"{path} failed after {tries} tries: {last}")
+    raise SarvamError(f"{path} failed: {last}")
+
+
+def chat(messages, *, temperature: float = 0.4, model: str = CHAT_MODEL,
+         max_tokens: int = 16000) -> str:
+    """Sarvam-105B chat completion -> assistant text.
+
+    sarvam-105b is a REASONING model: it spends completion tokens thinking
+    before it answers. Give it a generous max_tokens or it hits the ceiling
+    mid-reasoning and returns content=None. We also fall back to
+    reasoning_content and retry once if the answer comes back empty.
+    """
+    for attempt in range(2):
+        out = _post("/v1/chat/completions", json_body={
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        })
+        choice = out["choices"][0]
+        msg = choice.get("message", {}) or {}
+        content = msg.get("content") or msg.get("reasoning_content")
+        if content:
+            return content
+        # empty -> likely truncated mid-reasoning; retry with more room
+        max_tokens = min(max_tokens * 2, 32000)
+        time.sleep(1.0)
+    raise SarvamError(
+        f"chat returned empty content (finish_reason={choice.get('finish_reason')}); "
+        "raise max_tokens or shorten the prompt")
+
+
+def translate(text: str, target: str, source: str = "en-IN") -> str:
+    """Mayura translation for short strings."""
+    if not text.strip():
+        return text
+    out = _post("/translate", json_body={
+        "input": text,
+        "source_language_code": source,
+        "target_language_code": target,
+        "model": TRANSLATE_MODEL,
+    })
+    return out.get("translated_text", text)
+
+
+def detect_language(text: str) -> str:
+    out = _post("/text-lid", json_body={"input": text[:500]})
+    return out.get("language_code", "unknown")
+
+
+def tts(text: str, lang: str, *, speaker: str | None = None,
+        model: str = TTS_MODEL_DEFAULT) -> bytes:
+    """Bulbul text-to-speech -> raw WAV bytes."""
+    if not speaker:
+        speaker = "shubh_enhi_ads" if model.startswith("bulbul:v4") else "shubh"
+    out = _post("/text-to-speech", json_body={
+        "text": text[:2400],                 # REST cap is 2500 chars
+        "language_code": lang,
+        "speaker": speaker,
+        "model": model,
+        "speech_sample_rate": 24000,
+        "enable_preprocessing": True,        # normalises numbers/abbreviations
+    })
+    audios = out.get("audios") or []
+    if not audios:
+        raise SarvamError("TTS returned no audio")
+    return base64.b64decode(audios[0])
+
+
+def asr(audio_path: str, *, mode: str = "codemix",
+        model: str = "saaras:v4") -> dict:
+    """Saaras speech-to-text. Returns {transcript, language_code, ...}.
+
+    NOTE: the multipart part MUST carry an explicit audio MIME type,
+    otherwise the API rejects it with 'Invalid file type: None'.
+    """
+    with open(audio_path, "rb") as f:
+        out = _post(
+            "/speech-to-text",
+            files={"file": (os.path.basename(audio_path), f, "audio/wav")},
+            data={"model": model, "mode": mode},
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 1. PDF -> text
+# ---------------------------------------------------------------------------
+def extract_text(pdf_path: str, max_chars: int = 24000) -> str:
+    if pdf_path.lower().endswith(".txt"):
+        with open(pdf_path, encoding="utf-8") as f:
+            return f.read()[:max_chars]
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(pdf_path)
+    pages = [(p.extract_text() or "") for p in reader.pages]
+    text = "\n".join(pages)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text.strip()) < 200:
+        print("  ! very little text extracted - the PDF may be a scan. "
+              "Use Sarvam Vision (document intelligence) for OCR instead.")
+    return text[:max_chars]
+
+
+# ---------------------------------------------------------------------------
+# 2. text -> structured outline
+# ---------------------------------------------------------------------------
+OUTLINE_PROMPT = Template("""You are an expert science communicator making a slide deck
+for a COMPLETE BEGINNER who has never heard of this topic.
+
+Return ONLY valid JSON (no markdown fences) in exactly this shape:
+{
+  "deck_title": "short, catchy",
+  "deck_subtitle": "one line on what this is about",
+  "slides": [
+    {
+      "title": "...",
+      "bullets": ["...", "...", "..."],
+      "narration": "2-4 spoken sentences in plain language, no jargon. Written to be READ ALOUD. Define every technical term the first time it appears.",
+      "visual": "none | chart | timeline | comparison | diagram",
+      "visual_data": null
+    }
+  ]
+}
+
+For "visual_data", use the matching shape (or null when visual is "none"):
+  chart      -> {"items": [{"label": "...", "value": 12}, ...]}   (3-6 items)
+  timeline   -> {"steps": ["...", "...", "..."]}                  (3-5 steps)
+  comparison -> {"left": {"title": "...", "points": ["..."]},
+                 "right": {"title": "...", "points": ["..."]}}
+  diagram    -> {"nodes": ["...", "...", "..."]}                  (2-4 nodes, a flow)
+
+Rules:
+- 6 to 8 slides.
+- Slide 1 explains in one line what the paper is about.
+- Prefer a concrete visual over walls of text; use charts only if the paper has real numbers.
+
+PAPER:
+---
+$paper
+---
+""")
+
+
+def _loads_json(raw: str) -> dict:
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?", "", raw).strip()
+    raw = re.sub(r"```$", "", raw).strip()
+    # keep only the outermost object if the model added prose
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end != -1:
+        raw = raw[start:end + 1]
+    return json.loads(raw)
+
+
+def build_outline(paper_text: str, lang: str) -> dict:
+    lang_name = LANG_NAMES.get(lang, "English")
+    prompt = OUTLINE_PROMPT.substitute(paper=paper_text)
+    if lang != "en-IN":
+        prompt += (f"\nIMPORTANT: write ALL human-readable text (titles, bullets, "
+                   f"narration, visual labels) in {lang_name}. Keep JSON keys in English.")
+    raw = chat([
+        {"role": "system", "content":
+         "You are a JSON generator. Output only valid JSON. Do not write "
+         "explanations or reasoning in the answer."},
+        {"role": "user", "content": prompt},
+    ], temperature=0.4)
+    outline = _loads_json(raw)
+    outline.setdefault("deck_title", "Research Paper Explained")
+    outline.setdefault("deck_subtitle", "")
+    outline.setdefault("slides", [])
+    return outline
+
+
+# ---------------------------------------------------------------------------
+# 3. optional localisation via the Translate API
+# ---------------------------------------------------------------------------
+def localise(outline: dict, target: str) -> dict:
+    """Translate an English outline into `target` using Mayura, field by field."""
+    def tr(s):
+        return translate(s, target) if isinstance(s, str) and s.strip() else s
+
+    outline["deck_title"] = tr(outline.get("deck_title", ""))
+    outline["deck_subtitle"] = tr(outline.get("deck_subtitle", ""))
+    for slide in outline.get("slides", []):
+        slide["title"] = tr(slide.get("title", ""))
+        slide["bullets"] = [tr(b) for b in slide.get("bullets", [])]
+        slide["narration"] = tr(slide.get("narration", ""))
+        vd = slide.get("visual_data")
+        if isinstance(vd, dict):
+            if "items" in vd:
+                for it in vd["items"]:
+                    it["label"] = tr(it.get("label", ""))
+            if "steps" in vd:
+                vd["steps"] = [tr(s) for s in vd["steps"]]
+            if "nodes" in vd:
+                vd["nodes"] = [tr(s) for s in vd["nodes"]]
+            for side in ("left", "right"):
+                if side in vd:
+                    vd[side]["title"] = tr(vd[side].get("title", ""))
+                    vd[side]["points"] = [tr(p) for p in vd[side].get("points", [])]
+    return outline
+
+
+# ---------------------------------------------------------------------------
+# 4. narration -> audio
+# ---------------------------------------------------------------------------
+def synthesise(outline: dict, lang: str, outdir: str, *,
+               speaker: str | None, model: str) -> list[str]:
+    files = []
+    for i, slide in enumerate(outline["slides"], 1):
+        name = f"slide{i:02d}.wav"
+        path = os.path.join(outdir, name)
+        if not os.path.exists(path):
+            audio = tts(slide.get("narration", slide.get("title", "")),
+                        lang, speaker=speaker, model=model)
+            with open(path, "wb") as f:
+                f.write(audio)
+        files.append(name)
+        print(f"    audio {i}/{len(outline['slides'])} -> {name}")
+    return files
+
+
+# ---------------------------------------------------------------------------
+# 5. outline -> reveal.js HTML (with inline SVG visuals)
+# ---------------------------------------------------------------------------
+def _svg_chart(items: list) -> str:
+    items = [it for it in items if isinstance(it, dict)][:6]
+    if not items:
+        return ""
+    w, row_h, pad = 720, 56, 8
+    mx = max((abs(it.get("value", 0)) or 1) for it in items)
+    h = row_h * len(items) + pad
+    parts = [f'<svg viewBox="0 0 {w} {h}" class="viz">']
+    for i, it in enumerate(items):
+        val = abs(it.get("value", 0))
+        bw = int((val / mx) * (w - 260))
+        y = i * row_h + pad
+        parts.append(f'<text x="0" y="{y + 22}" class="viz-label">'
+                     f'{_esc(str(it.get("label", "")))[:22]}</text>')
+        parts.append(f'<rect x="200" y="{y}" width="{bw}" height="30" rx="4" '
+                     f'fill="#3b5bdb"/>')
+        parts.append(f'<text x="{200 + bw + 8}" y="{y + 21}" '
+                     f'class="viz-val">{_esc(str(it.get("value", "")))}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _svg_timeline(steps: list) -> str:
+    steps = [s for s in steps][:5]
+    if not steps:
+        return ""
+    w, h = 900, 140
+    n = len(steps)
+    gap = w // (n + 1)
+    parts = [f'<svg viewBox="0 0 {w} {h}" class="viz">',
+             f'<line x1="{gap}" y1="50" x2="{w - gap}" y2="50" '
+             f'stroke="#adb5bd" stroke-width="3"/>']
+    for i, s in enumerate(steps):
+        cx = gap * (i + 1)
+        parts.append(f'<circle cx="{cx}" cy="50" r="14" fill="#3b5bdb"/>')
+        parts.append(f'<text x="{cx}" y="55" class="viz-step" '
+                     f'text-anchor="middle">{i + 1}</text>')
+        parts.append(f'<text x="{cx}" y="90" class="viz-label" '
+                     f'text-anchor="middle">{_esc(str(s))[:18]}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _svg_comparison(vd: dict) -> str:
+    def col(side, x):
+        d = vd.get(side, {}) or {}
+        pts = "".join(f'<text x="{x + 16}" y="{120 + i * 34}" class="viz-label">'
+                      f'- {_esc(str(p))[:26]}</text>'
+                      for i, p in enumerate(d.get("points", [])[:4]))
+        return (f'<rect x="{x}" y="40" width="400" height="260" rx="10" '
+                f'fill="#f1f3f5" stroke="#ced4da"/>'
+                f'<text x="{x + 16}" y="85" class="viz-title">'
+                f'{_esc(str(d.get("title", "")))[:24]}</text>{pts}')
+
+    return (f'<svg viewBox="0 0 900 320" class="viz">'
+            f'{col("left", 20)}{col("right", 480)}</svg>')
+
+
+def _svg_diagram(nodes: list) -> str:
+    nodes = [n for n in nodes][:4]
+    if not nodes:
+        return ""
+    w, h = 900, 120
+    n = len(nodes)
+    gap = w // (n + 1)
+    parts = [f'<svg viewBox="0 0 {w} {h}" class="viz">']
+    for i, node in enumerate(nodes):
+        cx = gap * (i + 1)
+        parts.append(f'<rect x="{cx - 80}" y="35" width="160" height="50" rx="8" '
+                     f'fill="#e7f5ff" stroke="#3b5bdb"/>')
+        parts.append(f'<text x="{cx}" y="65" class="viz-label" '
+                     f'text-anchor="middle">{_esc(str(node))[:20]}</text>')
+        if i < n - 1:
+            parts.append(f'<text x="{cx + gap // 2}" y="66" class="viz-val" '
+                         f'text-anchor="middle">&#8594;</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def render_visual(slide: dict) -> str:
+    kind = (slide.get("visual") or "none").lower()
+    vd = slide.get("visual_data") or {}
+    try:
+        if kind == "chart" and isinstance(vd, dict):
+            return _svg_chart(vd.get("items", []))
+        if kind == "timeline" and isinstance(vd, dict):
+            return _svg_timeline(vd.get("steps", []))
+        if kind == "comparison" and isinstance(vd, dict):
+            return _svg_comparison(vd)
+        if kind == "diagram" and isinstance(vd, dict):
+            return _svg_diagram(vd.get("nodes", []))
+    except Exception:
+        pass
+    return ""
+
+
+def _esc(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+DECK_HTML = Template("""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$title</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/theme/white.css">
+<style>
+  .reveal h2 { font-size: 1.5em; color: #212529; }
+  .reveal .subtitle { font-size: .7em; color: #868e96; margin-top: -.4em; }
+  .reveal ul { font-size: .75em; }
+  .viz { width: 100%; max-height: 340px; margin-top: 18px; }
+  .viz-label { font-size: 15px; fill: #343a40; font-family: sans-serif; }
+  .viz-val { font-size: 15px; fill: #3b5bdb; font-weight: 600; font-family: sans-serif; }
+  .viz-title { font-size: 18px; fill: #212529; font-weight: 700; font-family: sans-serif; }
+  .viz-step { font-size: 14px; fill: #fff; font-weight: 700; font-family: sans-serif; }
+  .narr-bar { display: flex; align-items: center; gap: 14px; margin-top: 16px; }
+  .narr-bar audio { flex: 1; }
+  .badge { font-size: .45em; color: #adb5bd; }
+  .notes { font-size: .5em; color: #868e96; margin-top: 14px; }
+</style></head>
+<body>
+<div class="reveal"><div class="slides">
+$slides
+</div></div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.js"></script>
+<script>
+  Reveal.initialize({ hash: true, controls: true, progress: true });
+  function playCurrent() {
+    document.querySelectorAll('audio').forEach(a => { a.pause(); a.currentTime = 0; });
+    var a = Reveal.getCurrentSlide().querySelector('audio');
+    if (a) a.play().catch(function(){});
+  }
+  Reveal.on('slidechanged', playCurrent);
+  Reveal.on('ready', playCurrent);
+  document.addEventListener('keydown', function(e){ if (e.key === 'p') playCurrent(); });
+</script>
+</body></html>
+""")
+
+SLIDE_HTML = Template("""  <section>
+    <h2>$title</h2>
+    <ul>$bullets</ul>
+    $visual
+    <div class="narr-bar">
+      <audio controls src="$audio"></audio>
+      <span class="badge">narrated</span>
+    </div>
+  </section>
+""")
+
+TITLE_SLIDE = Template("""  <section>
+    <h2>$title</h2>
+    <p class="subtitle">$subtitle</p>
+    <div class="narr-bar">
+      <audio controls src="$audio"></audio>
+      <span class="badge">narrated</span>
+    </div>
+  </section>
+""")
+
+
+def render_html(outline: dict, audio_files: list[str], out_path: str):
+    blocks = []
+    # title slide (reuses slide 1's audio if there is one)
+    first_audio = audio_files[0] if audio_files else ""
+    blocks.append(TITLE_SLIDE.substitute(
+        title=_esc(outline.get("deck_title", "")),
+        subtitle=_esc(outline.get("deck_subtitle", "")),
+        audio=first_audio,
+    ))
+    for slide, audio in zip(outline["slides"], audio_files):
+        bullets = "".join(f"<li>{_esc(b)}</li>" for b in slide.get("bullets", []))
+        blocks.append(SLIDE_HTML.substitute(
+            title=_esc(slide.get("title", "")),
+            bullets=bullets,
+            visual=render_visual(slide),
+            audio=audio,
+        ))
+    html = DECK_HTML.substitute(title=_esc(outline.get("deck_title", "Deck")),
+                                slides="\n".join(blocks))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Research paper -> narrated deck")
+    ap.add_argument("pdf", help="path to the paper (.pdf or .txt)")
+    ap.add_argument("--lang", default="en-IN", choices=sorted(LANG_NAMES),
+                    help="narration language (default en-IN)")
+    ap.add_argument("--speaker", default=None, help="Bulbul speaker/voice id")
+    ap.add_argument("--model", default=TTS_MODEL_DEFAULT,
+                    help="TTS model (bulbul:v3 or bulbul:v4-flash)")
+    ap.add_argument("--outdir", default="deck")
+    ap.add_argument("--translate", action="store_true",
+                    help="build in English, then localise via the Translate API")
+    args = ap.parse_args()
+
+    if not API_KEY:
+        sys.exit("Set SARVAM_API_KEY first (get one at dashboard.sarvam.ai).")
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    print("[1/5] extracting text from PDF...")
+    paper = extract_text(args.pdf)
+    print(f"      {len(paper)} characters")
+
+    print("[2/5] building the outline with Sarvam-105B...")
+    outline = build_outline(paper, "en-IN" if args.translate else args.lang)
+    print(f"      {len(outline['slides'])} slides")
+
+    if args.translate and args.lang != "en-IN":
+        print(f"[2b ] localising to {args.lang} via Translate API...")
+        outline = localise(outline, args.lang)
+
+    with open(os.path.join(args.outdir, "outline.json"), "w", encoding="utf-8") as f:
+        json.dump(outline, f, ensure_ascii=False, indent=2)
+
+    print("[3/5] synthesising narration with Bulbul...")
+    audio_files = synthesise(outline, args.lang, args.outdir,
+                             speaker=args.speaker, model=args.model)
+
+    print("[4/5] rendering the deck...")
+    index = os.path.join(args.outdir, "index.html")
+    render_html(outline, audio_files, index)
+
+    print("[5/5] done.")
+    print(f"      open: {index}")
+
+
+if __name__ == "__main__":
+    main()

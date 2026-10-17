@@ -1,0 +1,15 @@
+# secrets
+.env
+
+# generated output
+deck/
+deck_*/
+*.wav
+outline.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+sample_deck.zip
